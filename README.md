@@ -25,3 +25,15 @@
 ## Задание 1.5: Экспорт realm
 - `docker exec architecture-bionicpro-keycloak-1 /opt/keycloak/bin/kc.sh export --realm reports-realm --file /tmp/keycloak-results-export.json --users realm_file`
 - `docker cp architecture-bionicpro-keycloak-1:/tmp/keycloak-results-export.json ./keycloak/keycloak-results-export.json`
+
+## Задание 2.1: Архитектура решения для подготовки и получения отчётов
+![Архитектура сервиса отчётов](diagrams/task2_1-architecture.png)
+### Описание компонентов
+- **CRM (Битрикс24)** – источник данных о клиентах.
+- **База данных (PostgreSQL)** – хранилище телеметрии с протезов.
+- **Apache Airflow** – ETL-оркестратор, запускается по расписанию (`0 2 * * *`), извлекает данные из CRM и БД, трансформирует и загружает в ClickHouse.
+- **ClickHouse** – OLAP-база данных, содержит витрину `reports_mv` с агрегированными отчётами по пользователям.
+- **API (бэкенд)** – предоставляет эндпоинт `/reports`, который по сессионной cookie определяет пользователя и возвращает только его собственные данные из ClickHouse.
+- **Web Frontend (React)** – кнопка «Download Report» вызывает `/reports` и отображает полученные данные.
+### Примечание
+ETL-процесс запускается ежедневно в 2:00, поэтому отчёт содержит только данные, уже обработанные Airflow.
