@@ -1,5 +1,9 @@
 version: '3.8'
 
+networks:
+  bionic-net:
+    driver: bridge
+
 services:
   keycloak_db:
     image: postgres:14
@@ -11,6 +15,9 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    networks:
+      - bionic-net
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,7 +27,7 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
+    command:
       - start-dev
       - --import-realm
     volumes:
@@ -29,6 +36,9 @@ services:
       - "8080:8080"
     depends_on:
       - keycloak_db
+    networks:
+      - bionic-net
+
   frontend:
     build:
       context: ./frontend
@@ -37,6 +47,47 @@ services:
       - "3000:3000"
     environment:
       REACT_APP_API_URL: http://localhost:8000
+      # Эти переменные больше не используются фронтендом, но оставлены для информации
       REACT_APP_KEYCLOAK_URL: http://localhost:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    networks:
+      - bionic-net
+    depends_on:
+      - auth
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  auth:
+    build: ./auth-service
+    env_file:
+      - ./auth-service/.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - keycloak
+      - redis
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: openldap
+    environment:
+      LDAP_ORGANISATION: BionicPRO
+      LDAP_DOMAIN: example.com
+      LDAP_ADMIN_PASSWORD: admin
+    volumes:
+      - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/50-config.ldif
+    ports:
+      - "389:389"
+    networks:
+      - bionic-net
+    restart: unless-stopped
