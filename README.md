@@ -1,6 +1,6 @@
 # Спринт 9: BionicPRO
 
-## Звдвние 1.1
+## Задание 1.1
 Для устранения уязвимостей и повышения безопасности предлагается следующая архитектура:
 1. Внедрение промежуточного бэкенд-сервиса `bionicpro-auth`
 - Выступает в роли доверенного посредника между фронтендом и `Keycloak`.
@@ -21,3 +21,7 @@
 - Используется для хранения сессий и токенов в распределённой среде (можно заменить на in-memory, но для production рекомендуется Redis).
 ### Диаграмма архитектуры (C4)
 ![Целевая архитектура безопасности BionicPRO](diagrams/task1_1-architecture.png)
+
+## Задание 1.5: Экспорт realm
+- `docker exec architecture-bionicpro-keycloak-1 /opt/keycloak/bin/kc.sh export --realm reports-realm --file /tmp/keycloak-results-export.json --users realm_file`
+- `docker cp architecture-bionicpro-keycloak-1:/tmp/keycloak-results-export.json ./keycloak/keycloak-results-export.json`
