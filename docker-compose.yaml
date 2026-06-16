@@ -1,5 +1,9 @@
 version: '3.8'
 
+networks:
+  bionic-net:
+    driver: bridge
+
 services:
   keycloak_db:
     image: postgres:14
@@ -11,6 +15,9 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    networks:
+      - bionic-net
+
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,7 +27,7 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
+    command:
       - start-dev
       - --import-realm
     volumes:
@@ -29,6 +36,9 @@ services:
       - "8080:8080"
     depends_on:
       - keycloak_db
+    networks:
+      - bionic-net
+
   frontend:
     build:
       context: ./frontend
@@ -37,6 +47,191 @@ services:
       - "3000:3000"
     environment:
       REACT_APP_API_URL: http://localhost:8000
+      # Эти переменные больше не используются фронтендом, но оставлены для информации
       REACT_APP_KEYCLOAK_URL: http://localhost:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    networks:
+      - bionic-net
+    depends_on:
+      - auth
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  auth:
+    build: ./auth-service
+    env_file:
+      - ./auth-service/.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - keycloak
+      - redis
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: openldap
+    environment:
+      LDAP_ORGANISATION: BionicPRO
+      LDAP_DOMAIN: example.com
+      LDAP_ADMIN_PASSWORD: admin
+    # volumes:
+    #   - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/50-config.ldif
+    ports:
+      - "389:389"
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  airflow-postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  airflow-init:
+    build: ./airflow
+    depends_on:
+      - airflow-postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    command: >
+      bash -c "airflow db init && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com"
+    networks:
+      - bionic-net
+
+  airflow-webserver:
+    build: ./airflow
+    ports:
+      - "8081:8080"
+    depends_on:
+      - airflow-postgres
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: UTC
+    command: airflow webserver
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build: ./airflow
+    depends_on:
+      - airflow-postgres
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    command: airflow scheduler
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9001:9000"   # API
+      - "9002:9001"   # Console (web UI)
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - ./minio-data:/data
+    networks:
+      - bionic-net
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+
+  nginx-cdn:
+    image: nginx:alpine
+    ports:
+      - "8082:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/cache:/var/cache/nginx
+    depends_on:
+      - minio
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  crm_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: crm
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+    volumes:
+      - ./crm-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      - bionic-net
+    restart: unless-stopped
+    command: postgres -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - bionic-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  kafka-connect:
+    image: debezium/connect:2.4
+    depends_on:
+      - kafka
+      - crm_db
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+    ports:
+      - "8083:8083"
+    networks:
+      - bionic-net
+    restart: unless-stopped

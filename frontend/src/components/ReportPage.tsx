@@ -1,28 +1,57 @@
-import React, { useState } from 'react';
-import { useKeycloak } from '@react-keycloak/web';
+import React, { useState, useEffect } from 'react';
+
+const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
 const ReportPage: React.FC = () => {
-  const { keycloak, initialized } = useKeycloak();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [user, setUser] = useState<any>(null);
+  const [reportData, setReportData] = useState<any[]>([]);
+
+  useEffect(() => {
+    fetch(`${API_URL}/auth/user`, { credentials: 'include' })
+      .then(res => {
+        if (res.ok) return res.json();
+        throw new Error('Not authenticated');
+      })
+      .then(data => setUser(data))
+      .catch(() => setUser(null));
+  }, []);
+
+  const login = () => {
+    window.location.href = `${API_URL}/auth/login`;
+  };
+
+  const logout = async () => {
+    await fetch(`${API_URL}/auth/logout`, {
+      method: 'POST',
+      credentials: 'include'
+    });
+    window.location.href = '/';
+  };
 
   const downloadReport = async () => {
-    if (!keycloak?.token) {
-      setError('Not authenticated');
-      return;
-    }
-
     try {
       setLoading(true);
       setError(null);
-
-      const response = await fetch(`${process.env.REACT_APP_API_URL}/reports`, {
-        headers: {
-          'Authorization': `Bearer ${keycloak.token}`
-        }
+      const response = await fetch(`${API_URL}/reports?period=last_7_days`, {
+        credentials: 'include'
       });
+      if (!response.ok) throw new Error('Failed to download report');
+      const data = await response.json();
 
-      
+      if (data.report_url) {
+        // Если есть ссылка на CDN – открываем в новой вкладке
+        window.open(data.report_url, '_blank');
+        // Также можно отобразить, что ссылка получена
+        setReportData([{ message: 'Report is available at: ' + data.report_url }]);
+      } else if (data.data) {
+        // Если вернулись данные напрямую (например, не сохранилось в S3)
+        setReportData(data.data);
+      } else {
+        // Если пришло сообщение об отсутствии данных
+        setReportData(data.message ? [{ message: data.message }] : []);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
@@ -30,17 +59,10 @@ const ReportPage: React.FC = () => {
     }
   };
 
-  if (!initialized) {
-    return <div>Loading...</div>;
-  }
-
-  if (!keycloak.authenticated) {
+  if (user === null) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-        <button
-          onClick={() => keycloak.login()}
-          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-        >
+        <button onClick={login} className="px-4 py-2 bg-blue-500 text-white rounded">
           Login
         </button>
       </div>
@@ -49,23 +71,27 @@ const ReportPage: React.FC = () => {
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-      <div className="p-8 bg-white rounded-lg shadow-md">
+      <div className="p-8 bg-white rounded-lg shadow-md w-full max-w-4xl">
         <h1 className="text-2xl font-bold mb-6">Usage Reports</h1>
-        
-        <button
-          onClick={downloadReport}
-          disabled={loading}
-          className={`px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 ${
-            loading ? 'opacity-50 cursor-not-allowed' : ''
-          }`}
-        >
-          {loading ? 'Generating Report...' : 'Download Report'}
+        <p className="mb-4">Welcome, {user.name || user.email}</p>
+        <button onClick={downloadReport} disabled={loading} className="px-4 py-2 bg-blue-500 text-white rounded">
+          {loading ? 'Generating...' : 'Download Report'}
         </button>
+        <button onClick={logout} className="ml-2 px-4 py-2 bg-gray-500 text-white rounded">
+          Logout
+        </button>
+        {error && <div className="mt-4 text-red-600">{error}</div>}
 
-        {error && (
-          <div className="mt-4 p-4 bg-red-100 text-red-700 rounded">
-            {error}
+        {reportData.length > 0 && (
+          <div className="mt-6 overflow-auto">
+            <h2 className="text-xl font-bold mb-2">Report Data</h2>
+            <pre className="bg-gray-100 p-4 rounded text-sm">
+              {JSON.stringify(reportData, null, 2)}
+            </pre>
           </div>
+        )}
+        {reportData.length === 0 && !loading && !error && (
+          <div className="mt-4 text-gray-500">No report data available for this user.</div>
         )}
       </div>
     </div>
