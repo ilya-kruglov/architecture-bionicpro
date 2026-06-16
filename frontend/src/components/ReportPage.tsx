@@ -9,7 +9,6 @@ const ReportPage: React.FC = () => {
   const [reportData, setReportData] = useState<any[]>([]);
 
   useEffect(() => {
-    // Проверка аутентификации при загрузке
     fetch(`${API_URL}/auth/user`, { credentials: 'include' })
       .then(res => {
         if (res.ok) return res.json();
@@ -40,7 +39,19 @@ const ReportPage: React.FC = () => {
       });
       if (!response.ok) throw new Error('Failed to download report');
       const data = await response.json();
-      setReportData(data);
+
+      if (data.report_url) {
+        // Если есть ссылка на CDN – открываем в новой вкладке
+        window.open(data.report_url, '_blank');
+        // Также можно отобразить, что ссылка получена
+        setReportData([{ message: 'Report is available at: ' + data.report_url }]);
+      } else if (data.data) {
+        // Если вернулись данные напрямую (например, не сохранилось в S3)
+        setReportData(data.data);
+      } else {
+        // Если пришло сообщение об отсутствии данных
+        setReportData(data.message ? [{ message: data.message }] : []);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
