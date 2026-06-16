@@ -88,6 +88,7 @@ def get_report_from_s3(user_id: str, period: str):
         raise
 
 
+# === Эндпоинты авторизации ===
 @app.get("/auth/login")
 async def login():
     state = secrets.token_urlsafe(32)
@@ -237,6 +238,7 @@ async def get_user(request: Request):
     return resp.json()
 
 
+# === Эндпоинт отчётов с использованием витрины (CDC) ===
 @app.get("/reports")
 async def get_report(request: Request):
     # 1. Проверка аутентификации
@@ -254,17 +256,17 @@ async def get_report(request: Request):
     # 3. Проверка наличия в S3
     report_from_s3 = get_report_from_s3(user_id, period)
     if report_from_s3 is not None:
-        # Возвращаем ссылку на CDN
         cdn_url = f"{CDN_BASE_URL}/reports/{user_id}/{period}.json"
         return {"report_url": cdn_url}
 
-    # 4. Генерация из ClickHouse
-    date_from = "2026-01-01"  # упрощённо
+    # 4. Генерация из ClickHouse — НОВАЯ ВИТРИНА (обновляется через CDC)
+    date_from = "2026-01-01"  # упрощённо; в реальности нужно вычислять
     try:
         client = Client(host='clickhouse', port=9000, user='default', password='')
+        # Используем витрину, построенную на основе данных из Kafka (CDC)
         query = """
             SELECT user_id, report_date, total_signals, avg_battery, unique_movements, customer_name, customer_email
-            FROM reports.reports_mv
+            FROM reports.report_mv   -- заменили reports_mv на report_mv
             WHERE user_id = %(user_id)s AND report_date >= %(date_from)s
             ORDER BY report_date DESC
         """
@@ -293,6 +295,5 @@ async def get_report(request: Request):
     except Exception as e:
         print(f"Failed to save report to S3: {e}")
 
-    # 6. Возвращаем ссылку на CDN и сами данные на случай, если сохранение не удалось
     cdn_url = f"{CDN_BASE_URL}/reports/{user_id}/{period}.json"
     return {"report_url": cdn_url, "data": report_data}
