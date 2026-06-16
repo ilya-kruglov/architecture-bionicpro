@@ -3,9 +3,12 @@ import hashlib
 import os
 import secrets
 import uuid
+import json
 from urllib.parse import urlencode
 
 import httpx
+import boto3
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -18,18 +21,71 @@ app = FastAPI()
 # Разрешаем запросы с фронтенда
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],   # конкретный источник
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# === Настройки Keycloak ===
 KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "http://localhost:8080")
 KEYCLOAK_EXTERNAL_URL = os.getenv("KEYCLOAK_EXTERNAL_URL", "http://localhost:8080")
 REALM = os.getenv("KEYCLOAK_REALM", "reports-realm")
 CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "reports-frontend")
 REDIRECT_URI = "http://localhost:8000/auth/callback"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", 3600))
+
+# === Настройки S3 (Minio) ===
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "reports")
+CDN_BASE_URL = os.getenv("CDN_BASE_URL", "http://localhost:8082")
+
+
+def get_s3_client():
+    return boto3.client(
+        's3',
+        endpoint_url=MINIO_ENDPOINT,
+        aws_access_key_id=MINIO_ACCESS_KEY,
+        aws_secret_access_key=MINIO_SECRET_KEY,
+        region_name='us-east-1',
+        config=boto3.session.Config(signature_version='s3v4'),
+    )
+
+
+def ensure_bucket_exists():
+    client = get_s3_client()
+    try:
+        client.head_bucket(Bucket=MINIO_BUCKET)
+    except ClientError:
+        client.create_bucket(Bucket=MINIO_BUCKET)
+
+
+@app.on_event("startup")
+async def startup_event():
+    ensure_bucket_exists()
+
+
+def save_report_to_s3(user_id: str, period: str, data: list):
+    client = get_s3_client()
+    key = f"{user_id}/{period}.json"
+    body = json.dumps(data).encode('utf-8')
+    client.put_object(Bucket=MINIO_BUCKET, Key=key, Body=body, ContentType='application/json')
+    return key
+
+
+def get_report_from_s3(user_id: str, period: str):
+    client = get_s3_client()
+    key = f"{user_id}/{period}.json"
+    try:
+        response = client.get_object(Bucket=MINIO_BUCKET, Key=key)
+        content = response['Body'].read().decode('utf-8')
+        return json.loads(content)
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return None
+        raise
 
 
 @app.get("/auth/login")
@@ -39,7 +95,6 @@ async def login():
     digest = hashlib.sha256(code_verifier.encode()).digest()
     code_challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
-    # Сохраняем verifier в Redis по state
     redis_client.setex(f"pkce:{state}", 600, code_verifier)
 
     params = {
@@ -51,7 +106,6 @@ async def login():
         "code_challenge_method": "S256",
         "scope": "openid profile email"
     }
-    # Используем ВНЕШНИЙ URL для редиректа браузера
     auth_url = f"{KEYCLOAK_EXTERNAL_URL}/realms/{REALM}/protocol/openid-connect/auth"
     redirect_url = f"{auth_url}?{urlencode(params)}"
     return RedirectResponse(redirect_url)
@@ -59,12 +113,10 @@ async def login():
 
 @app.get("/auth/callback")
 async def callback(code: str, state: str, response: Response):
-    # Восстанавливаем code_verifier
     code_verifier = redis_client.get(f"pkce:{state}")
     if not code_verifier:
         raise HTTPException(400, "Invalid state")
 
-    # Обмен кода на токены
     token_url = f"{KEYCLOAK_URL}/realms/{REALM}/protocol/openid-connect/token"
     data = {
         "client_id": CLIENT_ID,
@@ -81,7 +133,6 @@ async def callback(code: str, state: str, response: Response):
 
     access_token = tokens["access_token"]
     refresh_token = tokens["refresh_token"]
-    # Декодируем access_token для получения user_id (sub)
     try:
         payload = jwt.decode(access_token, None, options={"verify_signature": False})
         user_id = payload.get("sub")
@@ -89,7 +140,6 @@ async def callback(code: str, state: str, response: Response):
         raise HTTPException(400, "Invalid token")
 
     session_id = str(uuid.uuid4())
-    # Храним refresh_token и access_token в Redis
     redis_client.hset(f"session:{session_id}", mapping={
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -97,7 +147,6 @@ async def callback(code: str, state: str, response: Response):
     })
     redis_client.expire(f"session:{session_id}", SESSION_TTL)
 
-    # Устанавливаем cookie
     response.set_cookie(
         key="session_id",
         value=session_id,
@@ -106,9 +155,8 @@ async def callback(code: str, state: str, response: Response):
         samesite="lax",
         max_age=SESSION_TTL,
         path="/",
-        domain="localhost"   # явно указываем домен
+        domain="localhost"
     )
-    # Редирект на фронтенд
     return RedirectResponse("http://localhost:3000")
 
 
@@ -116,10 +164,8 @@ async def callback(code: str, state: str, response: Response):
 async def logout(request: Request, response: Response):
     session_id = request.cookies.get("session_id")
     if session_id:
-        # Получаем refresh_token для выхода из Keycloak (опционально)
         refresh = redis_client.hget(f"session:{session_id}", "refresh_token")
         if refresh:
-            # Отзыв токена в Keycloak
             async with httpx.AsyncClient() as client:
                 await client.post(f"{KEYCLOAK_URL}/realms/{REALM}/protocol/openid-connect/logout",
                                   data={"client_id": CLIENT_ID, "refresh_token": refresh.decode()})
@@ -154,12 +200,10 @@ async def refresh_token(request: Request, response: Response):
 
     new_access = new_tokens["access_token"]
     new_refresh = new_tokens.get("refresh_token", refresh_token)
-    # Обновляем в Redis
     redis_client.hset(f"session:{session_id}", mapping={
         "access_token": new_access,
         "refresh_token": new_refresh
     })
-    # Ротация сессии (новый session_id)
     new_session_id = str(uuid.uuid4())
     redis_client.rename(f"session:{session_id}", f"session:{new_session_id}")
     redis_client.expire(f"session:{new_session_id}", SESSION_TTL)
@@ -183,7 +227,6 @@ async def get_user(request: Request):
     access_token = redis_client.hget(f"session:{session_id}", "access_token")
     if not access_token:
         raise HTTPException(401)
-    # Проксируем запрос userinfo в Keycloak
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{KEYCLOAK_URL}/realms/{REALM}/protocol/openid-connect/userinfo",
@@ -196,23 +239,27 @@ async def get_user(request: Request):
 
 @app.get("/reports")
 async def get_report(request: Request):
-    # 1. Проверка аутентификации через сессию
+    # 1. Проверка аутентификации
     session_id = request.cookies.get("session_id")
     if not session_id:
         raise HTTPException(401, "Not authenticated")
-
-    # 2. Получение user_id из Redis
     user_id = redis_client.hget(f"session:{session_id}", "user_id")
     if not user_id:
         raise HTTPException(401, "User not found")
     user_id = user_id.decode()
 
-    # 3. Параметры запроса (период) – пока игнорируем
-    # period = request.query_params.get("period", "last_7_days")
-    # Для простоты используем фиксированную дату (за последние 30 дней)
-    date_from = "2026-01-01"  # временно
+    # 2. Параметры
+    period = request.query_params.get("period", "last_7_days")
 
-    # 4. Запрос в ClickHouse
+    # 3. Проверка наличия в S3
+    report_from_s3 = get_report_from_s3(user_id, period)
+    if report_from_s3 is not None:
+        # Возвращаем ссылку на CDN
+        cdn_url = f"{CDN_BASE_URL}/reports/{user_id}/{period}.json"
+        return {"report_url": cdn_url}
+
+    # 4. Генерация из ClickHouse
+    date_from = "2026-01-01"  # упрощённо
     try:
         client = Client(host='clickhouse', port=9000, user='default', password='')
         query = """
@@ -228,7 +275,6 @@ async def get_report(request: Request):
     if not rows:
         return {"message": "No data available for this user"}
 
-    # Формируем отчёт
     report_data = [
         {
             "date": str(row[1]),
@@ -240,4 +286,13 @@ async def get_report(request: Request):
         }
         for row in rows
     ]
-    return report_data
+
+    # 5. Сохраняем в S3
+    try:
+        save_report_to_s3(user_id, period, report_data)
+    except Exception as e:
+        print(f"Failed to save report to S3: {e}")
+
+    # 6. Возвращаем ссылку на CDN и сами данные на случай, если сохранение не удалось
+    cdn_url = f"{CDN_BASE_URL}/reports/{user_id}/{period}.json"
+    return {"report_url": cdn_url, "data": report_data}
