@@ -10,8 +10,8 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from jose import jwt, JWTError
-
 from redis_client import redis_client
+from clickhouse_driver import Client
 
 app = FastAPI()
 
@@ -30,6 +30,7 @@ REALM = os.getenv("KEYCLOAK_REALM", "reports-realm")
 CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "reports-frontend")
 REDIRECT_URI = "http://localhost:8000/auth/callback"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", 3600))
+
 
 @app.get("/auth/login")
 async def login():
@@ -54,6 +55,7 @@ async def login():
     auth_url = f"{KEYCLOAK_EXTERNAL_URL}/realms/{REALM}/protocol/openid-connect/auth"
     redirect_url = f"{auth_url}?{urlencode(params)}"
     return RedirectResponse(redirect_url)
+
 
 @app.get("/auth/callback")
 async def callback(code: str, state: str, response: Response):
@@ -100,13 +102,15 @@ async def callback(code: str, state: str, response: Response):
         key="session_id",
         value=session_id,
         httponly=True,
-        secure=False,   # В production обязателен HTTPS (True)
+        secure=False,
         samesite="lax",
         max_age=SESSION_TTL,
-        path="/"
+        path="/",
+        domain="localhost"   # явно указываем домен
     )
     # Редирект на фронтенд
     return RedirectResponse("http://localhost:3000")
+
 
 @app.post("/auth/logout")
 async def logout(request: Request, response: Response):
@@ -122,6 +126,7 @@ async def logout(request: Request, response: Response):
         redis_client.delete(f"session:{session_id}")
     response.delete_cookie("session_id")
     return {"message": "Logged out"}
+
 
 @app.get("/auth/refresh")
 async def refresh_token(request: Request, response: Response):
@@ -169,6 +174,7 @@ async def refresh_token(request: Request, response: Response):
     )
     return {"message": "Token refreshed"}
 
+
 @app.get("/auth/user")
 async def get_user(request: Request):
     session_id = request.cookies.get("session_id")
@@ -186,3 +192,52 @@ async def get_user(request: Request):
         if resp.status_code != 200:
             raise HTTPException(401)
     return resp.json()
+
+
+@app.get("/reports")
+async def get_report(request: Request):
+    # 1. Проверка аутентификации через сессию
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(401, "Not authenticated")
+
+    # 2. Получение user_id из Redis
+    user_id = redis_client.hget(f"session:{session_id}", "user_id")
+    if not user_id:
+        raise HTTPException(401, "User not found")
+    user_id = user_id.decode()
+
+    # 3. Параметры запроса (период) – пока игнорируем
+    # period = request.query_params.get("period", "last_7_days")
+    # Для простоты используем фиксированную дату (за последние 30 дней)
+    date_from = "2026-01-01"  # временно
+
+    # 4. Запрос в ClickHouse
+    try:
+        client = Client(host='clickhouse', port=9000, user='default', password='')
+        query = """
+            SELECT user_id, report_date, total_signals, avg_battery, unique_movements, customer_name, customer_email
+            FROM reports.reports_mv
+            WHERE user_id = %(user_id)s AND report_date >= %(date_from)s
+            ORDER BY report_date DESC
+        """
+        rows = client.execute(query, {'user_id': user_id, 'date_from': date_from})
+    except Exception as e:
+        raise HTTPException(500, f"Database error: {str(e)}")
+
+    if not rows:
+        return {"message": "No data available for this user"}
+
+    # Формируем отчёт
+    report_data = [
+        {
+            "date": str(row[1]),
+            "total_signals": row[2],
+            "avg_battery": row[3],
+            "unique_movements": row[4],
+            "customer_name": row[5],
+            "customer_email": row[6],
+        }
+        for row in rows
+    ]
+    return report_data
