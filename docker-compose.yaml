@@ -91,3 +91,63 @@ services:
     networks:
       - bionic-net
     restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  airflow-postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  airflow-init:
+    build: ./airflow
+    depends_on:
+      - airflow-postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    command: >
+      bash -c "airflow db init && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com"
+    networks:
+      - bionic-net
+
+  airflow-webserver:
+    build: ./airflow
+    ports:
+      - "8081:8080"
+    depends_on:
+      - airflow-postgres
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: UTC
+    command: airflow webserver
+    networks:
+      - bionic-net
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build: ./airflow
+    depends_on:
+      - airflow-postgres
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    command: airflow scheduler
+    networks:
+      - bionic-net
+    restart: unless-stopped
